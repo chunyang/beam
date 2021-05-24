@@ -208,12 +208,16 @@ class _SdkContainerImageCloudBuilder(SdkContainerImageBuilder):
       credentials = None
     else:
       credentials = get_service_credentials()
+    # FIXME: This constructor calls credentials.authorize() which doesn't
+    # exist for google.auth.credentials.Credentials
     self._storage_client = storage.StorageV1(
         url='https://www.googleapis.com/storage/v1',
         credentials=credentials,
         get_credentials=(not self._google_cloud_options.no_auth),
         http=get_new_http(),
         response_encoding='utf8')
+    # FIXME: This constructor calls credentials.authorize() which doesn't
+    # exist for google.auth.credentials.Credentials
     self._cloudbuild_client = cloudbuild.CloudbuildV1(
         credentials=credentials,
         get_credentials=(not self._google_cloud_options.no_auth),

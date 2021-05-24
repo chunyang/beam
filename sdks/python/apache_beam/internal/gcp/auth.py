@@ -23,15 +23,9 @@ import logging
 import socket
 import threading
 
-from oauth2client.client import GoogleCredentials
+import google.auth
 
-from apache_beam.utils import retry
-
-# Protect against environments where apitools library is not available.
-try:
-  from apitools.base.py.credentials_lib import GceAssertionCredentials
-except ImportError:
-  GceAssertionCredentials = None
+from apache_beam import version
 
 # When we are running in GCE, we can authenticate with VM credentials.
 is_running_in_gce = False
@@ -42,18 +36,14 @@ executing_project = None
 
 _LOGGER = logging.getLogger(__name__)
 
-if GceAssertionCredentials is not None:
 
-  class _GceAssertionCredentials(GceAssertionCredentials):
-    """GceAssertionCredentials with retry wrapper.
+def get_user_agent():
+  """For internal use only; no backwards-compatibility guarantees.
 
-    For internal use only; no backwards-compatibility guarantees.
-    """
-    @retry.with_exponential_backoff(
-        retry_filter=retry.retry_on_server_errors_and_timeout_filter)
-    def _do_refresh_request(self, http_request):
-      return super(_GceAssertionCredentials,
-                   self)._do_refresh_request(http_request)
+  Returns:
+    A str representing the Beam Python SDK.
+  """
+  return f"beam-python-sdk/{version.__version__}"
 
 
 def set_running_in_gce(worker_executing_project):
@@ -80,7 +70,7 @@ def get_service_credentials():
   Get credentials to access Google services.
 
   Returns:
-    A ``oauth2client.client.OAuth2Credentials`` object or None if credentials
+    A ``google.auth.credentials.Credentials`` object or None if credentials
     not found. Returned object is thread-safe.
   """
   return _Credentials.get_service_credentials()
@@ -115,29 +105,24 @@ class _Credentials(object):
 
   @staticmethod
   def _get_service_credentials():
-    if is_running_in_gce:
-      # We are currently running as a GCE taskrunner worker.
-      return _GceAssertionCredentials(user_agent='beam-python-sdk/1.0')
-    else:
-      client_scopes = [
-          'https://www.googleapis.com/auth/bigquery',
-          'https://www.googleapis.com/auth/cloud-platform',
-          'https://www.googleapis.com/auth/devstorage.full_control',
-          'https://www.googleapis.com/auth/userinfo.email',
-          'https://www.googleapis.com/auth/datastore',
-          'https://www.googleapis.com/auth/spanner.admin',
-          'https://www.googleapis.com/auth/spanner.data'
-      ]
-      try:
-        credentials = GoogleCredentials.get_application_default()
-        credentials = credentials.create_scoped(client_scopes)
-        logging.debug(
-            'Connecting using Google Application Default '
-            'Credentials.')
-        return credentials
-      except Exception as e:
-        _LOGGER.warning(
-            'Unable to find default credentials to use: %s\n'
-            'Connecting anonymously.',
-            e)
-        return None
+    client_scopes = [
+        'https://www.googleapis.com/auth/bigquery',
+        'https://www.googleapis.com/auth/cloud-platform',
+        'https://www.googleapis.com/auth/devstorage.full_control',
+        'https://www.googleapis.com/auth/userinfo.email',
+        'https://www.googleapis.com/auth/datastore',
+        'https://www.googleapis.com/auth/spanner.admin',
+        'https://www.googleapis.com/auth/spanner.data'
+    ]
+    try:
+      credentials = google.auth.default(scopes=client_scopes)
+      logging.debug(
+          'Connecting using Google Application Default '
+          'Credentials.')
+      return credentials
+    except Exception as e:
+      _LOGGER.warning(
+          'Unable to find default credentials to use: %s\n'
+          'Connecting anonymously.',
+          e)
+      return None

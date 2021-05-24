@@ -371,17 +371,17 @@ class TestBigQueryWrapper(unittest.TestCase):
         JOIN `dataset.table` as table ON av.column2 = table.column2
     """
     job = mock.MagicMock(spec=bigquery.Job)
-    job.statistics.query.referencedTables = [
-        bigquery.TableReference(
+    job.referenced_tables = [
+        dict(
             projectId="first_project_id",
             datasetId="first_dataset",
             tableId="table_used_by_authorized_view"),
-        bigquery.TableReference(
+        dict(
             projectId="second_project_id",
             datasetId="second_dataset",
             tableId="table"),
     ]
-    client.jobs.Insert.return_value = job
+    client.query.return_value = job
 
     wrapper = beam.io.gcp.bigquery_tools.BigQueryWrapper(client)
     wrapper.get_table_location = mock.Mock(

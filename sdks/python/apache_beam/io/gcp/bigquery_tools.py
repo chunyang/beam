@@ -42,6 +42,9 @@ from typing import TypeVar
 from typing import Union
 
 import fastavro
+import google.cloud.bigquery
+from google.api_core import client_info
+from google.api_core.exceptions import Forbidden, GoogleAPICallError, NotFound
 
 from apache_beam import coders
 from apache_beam.internal.gcp import auth
@@ -288,10 +291,13 @@ class BigQueryWrapper(object):
   HISTOGRAM_METRIC_LOGGER = MetricLogger()
 
   def __init__(self, client=None, temp_dataset_id=None):
-    self.client = client or bigquery.BigqueryV2(
-        http=get_new_http(),
+    # FIXME: This constructor calls credentials.authorize() which doesn't
+    # exist for google.auth.credentials.Credentials
+    # FIXME: Proxy support via... get_new_http?
+    self.client = client or google.cloud.bigquery.Client(
         credentials=auth.get_service_credentials(),
-        response_encoding='utf8')
+        client_info=client_info.ClientInfo(
+            user_agent=auth.get_user_agent()))
     self._unique_row_id = 0
     # For testing scenarios where we pass in a client we do not want a
     # randomized prefix for row IDs.
@@ -340,44 +346,36 @@ class BigQueryWrapper(object):
     provide error handling for queries that reference tables in multiple
     locations.
     """
-    reference = bigquery.JobReference(
-        jobId=uuid.uuid4().hex, projectId=project_id)
-    request = bigquery.BigqueryJobsInsertRequest(
-        projectId=project_id,
-        job=bigquery.Job(
-            configuration=bigquery.JobConfiguration(
-                dryRun=True,
-                query=bigquery.JobConfigurationQuery(
-                    query=query,
-                    useLegacySql=use_legacy_sql,
-                )),
-            jobReference=reference))
+    query_job = self.client.query(
+        query,
+        job_config=google.cloud.bigquery.QueryJobConfig(
+            dry_run=True,
+            use_legacy_sql=use_legacy_sql)
+        project=project_id)
 
-    response = self.client.jobs.Insert(request)
+    referenced_tables = query_job.referenced_tables
 
-    if response.statistics is None:
+    if referenced_tables is None:
       # This behavior is only expected in tests
       _LOGGER.warning(
-          "Unable to get location, missing response.statistics. Query: %s",
+          "Unable to get location, missing referenced_tables. Query: %s",
           query)
       return None
 
-    referenced_tables = response.statistics.query.referencedTables
-    if referenced_tables:  # Guards against both non-empty and non-None
-      for table in referenced_tables:
-        try:
-          location = self.get_table_location(
-              table.projectId, table.datasetId, table.tableId)
-        except HttpForbiddenError:
-          # Permission access for table (i.e. from authorized_view),
-          # try next one
-          continue
-        _LOGGER.info(
-            "Using location %r from table %r referenced by query %s",
-            location,
-            table,
-            query)
-        return location
+    for table in referenced_tables:
+      try:
+        location = self.get_table_location(
+            table["projectId"], table["datasetId"], table["tableId"])
+      except HttpForbiddenError:
+        # Permission access for table (i.e. from authorized_view),
+        # try next one
+        continue
+      _LOGGER.info(
+          "Using location %r from table %r referenced by query %s",
+          location,
+          table,
+          query)
+      return location
 
     _LOGGER.debug(
         "Query %s does not reference any tables or "
@@ -397,25 +395,18 @@ class BigQueryWrapper(object):
       create_disposition=None,
       write_disposition=None,
       job_labels=None):
-    reference = bigquery.JobReference()
-    reference.jobId = job_id
-    reference.projectId = project_id
-    request = bigquery.BigqueryJobsInsertRequest(
-        projectId=project_id,
-        job=bigquery.Job(
-            configuration=bigquery.JobConfiguration(
-                copy=bigquery.JobConfigurationTableCopy(
-                    destinationTable=to_table_reference,
-                    sourceTable=from_table_reference,
-                    createDisposition=create_disposition,
-                    writeDisposition=write_disposition,
-                ),
-                labels=_build_job_labels(job_labels),
-            ),
-            jobReference=reference,
-        ))
 
-    return self._start_job(request).jobReference
+    copy_job = self.client.copy_table(
+        sources=from_table_reference,
+        destination=to_table_reference,
+        job_id=job_id,
+        project=project_id,
+        job_config=google.cloud.bigquery.CopyJobConfig(
+            create_disposition=create_disposition,
+            labels=job_labels,
+            write_disposition=write_disposition))
+
+    return copy_job.to_api_repr()["jobReference"]
 
   @retry.with_exponential_backoff(
       num_retries=MAX_RETRIES,
@@ -434,42 +425,37 @@ class BigQueryWrapper(object):
       source_format=None,
       job_labels=None):
 
-    if not source_uris and not source_stream:
-      raise ValueError(
-          'Either a non-empty list of fully-qualified source URIs must be '
-          'provided via the source_uris parameter or an open file object must '
-          'be provided via the source_stream parameter. Got neither.')
-
     if source_uris and source_stream:
       raise ValueError(
           'Only one of source_uris and source_stream may be specified. '
           'Got both.')
 
-    if source_uris is None:
-      source_uris = []
-
     additional_load_parameters = additional_load_parameters or {}
-    job_schema = None if schema == 'SCHEMA_AUTODETECT' else schema
-    reference = bigquery.JobReference(jobId=job_id, projectId=project_id)
-    request = bigquery.BigqueryJobsInsertRequest(
-        projectId=project_id,
-        job=bigquery.Job(
-            configuration=bigquery.JobConfiguration(
-                load=bigquery.JobConfigurationLoad(
-                    sourceUris=source_uris,
-                    destinationTable=table_reference,
-                    schema=job_schema,
-                    writeDisposition=write_disposition,
-                    createDisposition=create_disposition,
-                    sourceFormat=source_format,
-                    useAvroLogicalTypes=True,
-                    autodetect=schema == 'SCHEMA_AUTODETECT',
-                    **additional_load_parameters),
-                labels=_build_job_labels(job_labels),
-            ),
-            jobReference=reference,
-        ))
-    return self._start_job(request, stream=source_stream).jobReference
+    shared_kwargs = dict(
+        destination=table_reference,
+        job_id=job_id,
+        project=project_id,
+        job_config=google.cloud.bigquery.LoadJobConfig(
+            create_disposition=create_disposition,
+            labels=job_labels,
+            schema=schema,
+            source_format=source_format,
+            write_disposition=write_disposition,
+            **additional_load_parameters))
+
+    if source_uris:
+      load_job = self.client.load_table_from_uri(
+          source_uris=source_uris, **shared_kwargs)
+    elif source_stream:
+      load_job = self.client.load_table_from_file(
+          file_obj=source_stream, **shared_kwargs)
+    else:
+      raise ValueError(
+          'Either a non-empty list of fully-qualified source URIs must be '
+          'provided via the source_uris parameter or an open file object must '
+          'be provided via the source_stream parameter. Got neither.')
+
+    return load_job.to_api_repr()["jobReference"]
 
   def _start_job(
       self,
@@ -520,33 +506,28 @@ class BigQueryWrapper(object):
       job_id,
       dry_run=False,
       kms_key=None,
-      job_labels=None):
-    reference = bigquery.JobReference(jobId=job_id, projectId=project_id)
-    request = bigquery.BigqueryJobsInsertRequest(
-        projectId=project_id,
-        job=bigquery.Job(
-            configuration=bigquery.JobConfiguration(
-                dryRun=dry_run,
-                query=bigquery.JobConfigurationQuery(
-                    query=query,
-                    useLegacySql=use_legacy_sql,
-                    allowLargeResults=not dry_run,
-                    destinationTable=self._get_temp_table(project_id)
-                    if not dry_run else None,
-                    flattenResults=flatten_results,
-                    destinationEncryptionConfiguration=bigquery.
-                    EncryptionConfiguration(kmsKeyName=kms_key)),
-                labels=_build_job_labels(job_labels),
-            ),
-            jobReference=reference))
+      job_labels=None) -> google.cloud.bigquery.QueryJob:
+    query_job = self.client.query(
+        query,
+        job_config=google.cloud.bigquery.QueryJobConfig(
+            allow_large_results=not dry_run,
+            destination=self._get_temp_table(project_id) if not dry_run else None,
+            destination_encryption_configuration=google.cloud.bigquery.EncryptionConfiguration(
+                kms_key_name=kms_key),
+            dry_run=dry_run,
+            flatten_results=flatten_results,
+            labels=job_labels,
+            use_legacy_sql=use_legacy_sql),
+        job_id=job_id,
+        project=project_id)
 
-    return self._start_job(request)
+    return query_job
 
   def wait_for_bq_job(self, job_reference, sleep_duration_sec=5, max_retries=0):
     """Poll job until it is DONE.
 
     Args:
-      job_reference: bigquery.JobReference instance.
+      job_reference: dict job reference, containing keys projectId, jobId, and location.
       sleep_duration_sec: Specifies the delay in seconds between retries.
       max_retries: The total number of times to retry. If equals to 0,
         the function waits forever.
@@ -559,7 +540,7 @@ class BigQueryWrapper(object):
     while True:
       retry += 1
       job = self.get_job(
-          job_reference.projectId, job_reference.jobId, job_reference.location)
+          job_reference["projectId"], job_reference["jobId"], job_reference["location"])
       logging.info('Job status: %s', job.status.state)
       if job.status.state == 'DONE' and job.status.errorResult:
         raise RuntimeError(
@@ -577,41 +558,15 @@ class BigQueryWrapper(object):
       retry_filter=retry.retry_on_server_errors_and_timeout_filter)
   def _get_query_results(
       self,
-      project_id,
-      job_id,
-      page_token=None,
-      max_results=10000,
-      location=None):
-    request = bigquery.BigqueryJobsGetQueryResultsRequest(
-        jobId=job_id,
-        pageToken=page_token,
-        projectId=project_id,
-        maxResults=max_results,
-        location=location)
-    response = self.client.jobs.GetQueryResults(request)
-    return response
+      job: google.cloud.bigquery.QueryJob) -> Union[google.cloud.bigquery.table.RowIterator, google.cloud.bigquery.table._EmptyRowIterator]:
+    return job.result()
 
+  # FIXME(cyang): Change retry filter to match new exception classes.
   @retry.with_exponential_backoff(
       num_retries=MAX_RETRIES,
       retry_filter=retry.retry_on_server_errors_timeout_or_quota_issues_filter)
   def _insert_all_rows(
       self, project_id, dataset_id, table_id, rows, skip_invalid_rows=False):
-    """Calls the insertAll BigQuery API endpoint.
-
-    Docs for this BQ call: https://cloud.google.com/bigquery/docs/reference\
-      /rest/v2/tabledata/insertAll."""
-    # The rows argument is a list of
-    # bigquery.TableDataInsertAllRequest.RowsValueListEntry instances as
-    # required by the InsertAll() method.
-    request = bigquery.BigqueryTabledataInsertAllRequest(
-        projectId=project_id,
-        datasetId=dataset_id,
-        tableId=table_id,
-        tableDataInsertAllRequest=bigquery.TableDataInsertAllRequest(
-            skipInvalidRows=skip_invalid_rows,
-            # TODO(silviuc): Should have an option for ignoreUnknownValues?
-            rows=rows))
-
     resource = resource_identifiers.BigQueryTable(
         project_id, dataset_id, table_id)
 
@@ -627,30 +582,35 @@ class BigQueryWrapper(object):
         monitoring_infos.BIGQUERY_DATASET_LABEL: dataset_id,
         monitoring_infos.BIGQUERY_TABLE_LABEL: table_id,
     }
+
     service_call_metric = ServiceCallMetric(
         request_count_urn=monitoring_infos.API_REQUEST_COUNT_URN,
         base_labels=labels)
 
-    started_millis = int(time.time() * 1000)
-    response = None
+    started = time.perf_counter()
     try:
-      response = self.client.tabledata.InsertAll(request)
-      if not response.insertErrors:
-        service_call_metric.call('ok')
-      for insert_error in response.insertErrors:
-        for error in insert_error.errors:
-          service_call_metric.call(error.reason)
-    except HttpError as e:
-      service_call_metric.call(e)
+      # TODO(silviuc): Should have an option for ignoreUnknownValues?
+      errors = self.client.insert_rows(
+          destination=google.cloud.bigquery.TableReference(
+              google.cloud.bigquery.DatasetReference(project_id, dataset_id),
+              table_id),
+          rows=rows,
+          skip_invalid_rows=skip_invalid_rows)
+    except GoogleAPICallError as ex:
+      service_call_metric.call(ex)
 
       # Re-reise the exception so that we re-try appropriately.
       raise
     finally:
       self._latency_histogram_metric.update(
-          int(time.time() * 1000) - started_millis)
-    if response:
-      return not response.insertErrors, response.insertErrors
-    return False, []
+          int((time.perf_counter() - started) * 1000))
+
+    if not errors:
+      service_call_metric.call('ok')
+    for error in errors:
+      service_call_metric.call(error["reaason"])
+
+    return not errors, errors
 
   @retry.with_exponential_backoff(
       num_retries=MAX_RETRIES,
@@ -659,20 +619,19 @@ class BigQueryWrapper(object):
     """Lookup a table's metadata object.
 
     Args:
-      client: bigquery.BigqueryV2 instance
       project_id: table lookup parameter
       dataset_id: table lookup parameter
       table_id: table lookup parameter
 
     Returns:
-      bigquery.Table instance
+      google.cloud.bigquery.Table instance
     Raises:
       HttpError: if lookup failed.
     """
-    request = bigquery.BigqueryTablesGetRequest(
-        projectId=project_id, datasetId=dataset_id, tableId=table_id)
-    response = self.client.tables.Get(request)
-    return response
+    return self.client.get_table(
+        google.cloud.bigquery.TableReference(
+            google.cloud.bigquery.DatasetReference(project_id, dataset_id),
+            table_id))
 
   def _create_table(
       self,
@@ -692,88 +651,68 @@ class BigQueryWrapper(object):
           table_id)
 
     additional_parameters = additional_parameters or {}
-    table = bigquery.Table(
-        tableReference=TableReference(
-            projectId=project_id, datasetId=dataset_id, tableId=table_id),
-        schema=schema,
-        **additional_parameters)
-    request = bigquery.BigqueryTablesInsertRequest(
-        projectId=project_id, datasetId=dataset_id, table=table)
-    response = self.client.tables.Insert(request)
+    table = self.client.create_table(
+        google.cloud.bigquery.Table(
+            google.cloud.bigquery.TableReference(
+                google.cloud.bigquery.DatasetReference(project_id, dataset_id),
+                table_id),
+            schema=schema),
+        **additional_parameters,
+    )
+
     _LOGGER.debug("Created the table with id %s", table_id)
-    # The response is a bigquery.Table instance.
-    return response
+    # The response is a google.cloud.bigquery.Table instance.
+    return table
 
   @retry.with_exponential_backoff(
       num_retries=MAX_RETRIES,
       retry_filter=retry.retry_on_server_errors_and_timeout_filter)
   def get_or_create_dataset(self, project_id, dataset_id, location=None):
-    # Check if dataset already exists otherwise create it
-    try:
-      dataset = self.client.datasets.Get(
-          bigquery.BigqueryDatasetsGetRequest(
-              projectId=project_id, datasetId=dataset_id))
-      return dataset
-    except HttpError as exn:
-      if exn.status_code == 404:
-        dataset_reference = bigquery.DatasetReference(
-            projectId=project_id, datasetId=dataset_id)
-        dataset = bigquery.Dataset(datasetReference=dataset_reference)
-        if location is not None:
-          dataset.location = location
-        request = bigquery.BigqueryDatasetsInsertRequest(
-            projectId=project_id, dataset=dataset)
-        response = self.client.datasets.Insert(request)
-        # The response is a bigquery.Dataset instance.
-        return response
-      else:
-        raise
+    dataset = google.cloud.bigquery.Dataset(
+        google.cloud.bigquery.DatasetReference(project_id, dataset_id))
+    dataset.location = location
+    # If a dataset already exists, create_dataset(exists_ok=True) returns the
+    # existing dataset.
+    return self.client.create_dataset(dataset, exists_ok=True)
 
   @retry.with_exponential_backoff(
       num_retries=MAX_RETRIES,
       retry_filter=retry.retry_on_server_errors_and_timeout_filter)
   def _is_table_empty(self, project_id, dataset_id, table_id):
-    request = bigquery.BigqueryTabledataListRequest(
-        projectId=project_id,
-        datasetId=dataset_id,
-        tableId=table_id,
-        maxResults=1)
-    response = self.client.tabledata.List(request)
-    # The response is a bigquery.TableDataList instance.
-    return response.totalRows == 0
+    row_iterator = self.client.list_rows(
+        google.cloud.bigquery.TableReference(
+            google.cloud.bigquery.DatasetReference(project_id, dataset_id),
+            table_id),
+        selected_fields=(),
+        max_results=1,
+    )
+
+    row_count = sum(1 for r in row_iterator)
+    return row_count == 0
 
   @retry.with_exponential_backoff(
       num_retries=MAX_RETRIES,
       retry_filter=retry.retry_on_server_errors_and_timeout_filter)
   def _delete_table(self, project_id, dataset_id, table_id):
-    request = bigquery.BigqueryTablesDeleteRequest(
-        projectId=project_id, datasetId=dataset_id, tableId=table_id)
     try:
-      self.client.tables.Delete(request)
-    except HttpError as exn:
-      if exn.status_code == 404:
-        _LOGGER.warning(
-            'Table %s:%s.%s does not exist', project_id, dataset_id, table_id)
-        return
-      else:
-        raise
+      self.client.delete_table(
+          google.cloud.bigquery.TableReference(
+              google.cloud.bigquery.DatasetReference(project_id, dataset_id),
+              table_id))
+    except NotFound:
+      _LOGGER.warning(
+          'Table %s:%s.%s does not exist', project_id, dataset_id, table_id)
 
   @retry.with_exponential_backoff(
       num_retries=MAX_RETRIES,
       retry_filter=retry.retry_on_server_errors_and_timeout_filter)
   def _delete_dataset(self, project_id, dataset_id, delete_contents=True):
-    request = bigquery.BigqueryDatasetsDeleteRequest(
-        projectId=project_id,
-        datasetId=dataset_id,
-        deleteContents=delete_contents)
     try:
-      self.client.datasets.Delete(request)
-    except HttpError as exn:
-      if exn.status_code == 404:
-        _LOGGER.warning('Dataset %s:%s does not exist', project_id, dataset_id)
-        return
-      else:
-        raise
+      self.client.delete_dataset(
+          google.cloud.bigquery.DatasetReference(project_id, dataset_id),
+          delete_contents=delete_contents)
+    except NotFound:
+      _LOGGER.warning('Dataset %s:%s does not exist', project_id, dataset_id)
 
   @retry.with_exponential_backoff(
       num_retries=MAX_RETRIES,
@@ -790,27 +729,23 @@ class BigQueryWrapper(object):
       not self.temp_dataset_id.startswith(self.TEMP_DATASET)
     # Check if dataset exists to make sure that the temporary id is unique
     try:
-      self.client.datasets.Get(
-          bigquery.BigqueryDatasetsGetRequest(
-              projectId=project_id, datasetId=self.temp_dataset_id))
+      self.client.get_dataset(
+          google.cloud.bigquery.DatasetReference(project_id, self.temp_dataset_id))
       if project_id is not None and not is_user_configured_dataset:
         # Unittests don't pass projectIds so they can be run without error
         # User configured datasets are allowed to pre-exist.
         raise RuntimeError(
             'Dataset %s:%s already exists so cannot be used as temporary.' %
             (project_id, self.temp_dataset_id))
-    except HttpError as exn:
-      if exn.status_code == 404:
-        _LOGGER.warning(
-            'Dataset %s:%s does not exist so we will create it as temporary '
-            'with location=%s',
-            project_id,
-            self.temp_dataset_id,
-            location)
-        self.get_or_create_dataset(
-            project_id, self.temp_dataset_id, location=location)
-      else:
-        raise
+    except NotFound:
+      _LOGGER.warning(
+          'Dataset %s:%s does not exist so we will create it as temporary '
+          'with location=%s',
+          project_id,
+          self.temp_dataset_id,
+          location)
+      self.get_or_create_dataset(
+          project_id, self.temp_dataset_id, location=location)
 
   @retry.with_exponential_backoff(
       num_retries=MAX_RETRIES,
@@ -818,38 +753,26 @@ class BigQueryWrapper(object):
   def clean_up_temporary_dataset(self, project_id):
     temp_table = self._get_temp_table(project_id)
     try:
-      self.client.datasets.Get(
-          bigquery.BigqueryDatasetsGetRequest(
-              projectId=project_id, datasetId=temp_table.datasetId))
-    except HttpError as exn:
-      if exn.status_code == 404:
-        _LOGGER.warning(
-            'Dataset %s:%s does not exist', project_id, temp_table.datasetId)
-        return
-      else:
-        raise
+      self.client.get_dataset(
+          google.cloud.bigquery.DatasetReference(project_id, temp_table.datasetId))
+    except NotFound:
+      _LOGGER.warning(
+          'Dataset %s:%s does not exist', project_id, temp_table.datasetId)
+      return
     try:
       self._delete_dataset(temp_table.projectId, temp_table.datasetId, True)
-    except HttpError as exn:
-      if exn.status_code == 403:
-        _LOGGER.warning(
-            'Permission denied to delete temporary dataset %s:%s for clean up',
-            temp_table.projectId,
-            temp_table.datasetId)
-        return
-      else:
-        raise
+    except Forbidden:
+      _LOGGER.warning(
+          'Permission denied to delete temporary dataset %s:%s for clean up',
+          temp_table.projectId,
+          temp_table.datasetId)
 
   @retry.with_exponential_backoff(
       num_retries=MAX_RETRIES,
       retry_filter=retry.retry_on_server_errors_and_timeout_filter)
   def get_job(self, project, job_id, location=None):
-    request = bigquery.BigqueryJobsGetRequest()
-    request.jobId = job_id
-    request.projectId = project
-    request.location = location
-
-    return self.client.jobs.Get(request)
+    return self.client.get_job(
+        job_id, project=project, location=location)
 
   def perform_load_job(
       self,
@@ -1058,31 +981,15 @@ class BigQueryWrapper(object):
         job_id=uuid.uuid4().hex,
         dry_run=dry_run,
         job_labels=job_labels)
-    job_id = job.jobReference.jobId
-    location = job.jobReference.location
+    job_id = job.job_id
+    location = job.location
 
     if dry_run:
       # If this was a dry run then the fact that we get here means the
       # query has no errors. The start_query_job would raise an error otherwise.
-      return
-    page_token = None
-    while True:
-      response = self._get_query_results(
-          project_id, job_id, page_token, location=location)
-      if not response.jobComplete:
-        # The jobComplete field can be False if the query request times out
-        # (default is 10 seconds). Note that this is a timeout for the query
-        # request not for the actual execution of the query in the service.  If
-        # the request times out we keep trying. This situation is quite possible
-        # if the query will return a large number of rows.
-        _LOGGER.info('Waiting on response from query: %s ...', query)
-        time.sleep(1.0)
-        continue
-      # We got some results. The last page is signalled by a missing pageToken.
-      yield response.rows, response.schema
-      if not response.pageToken:
-        break
-      page_token = response.pageToken
+      return None
+
+    return self._get_query_results(job)
 
   def insert_rows(
       self,
@@ -1100,30 +1007,38 @@ class BigQueryWrapper(object):
       table_id: The table id.
       rows: A list of plain Python dictionaries. Each dictionary is a row and
         each key in it is the name of a field.
+      insert_ids: Deprecated, ignored.
       skip_invalid_rows: If there are rows with insertion errors, whether they
         should be skipped, and all others should be inserted successfully.
 
     Returns:
       A tuple (bool, errors). If first element is False then the second element
-      will be a bigquery.InserttErrorsValueListEntry instance containing
-      specific errors.
+      will be a Sequence[Mapping] containing specific errors. In each Mapping,
+      the "index" key identifies the row and the "errors" key contains a list
+      of mappings describing one or more problems with the row.
     """
+    return self._insert_all_rows(
+        project_id,
+        datset_id,
+        table_id,
+        rows,
+        skip_invalid_rows=skip_invalid_rows)
 
-    # Prepare rows for insertion. Of special note is the row ID that we add to
-    # each row in order to help BigQuery avoid inserting a row multiple times.
-    # BigQuery will do a best-effort if unique IDs are provided. This situation
-    # can happen during retries on failures.
-    # TODO(silviuc): Must add support to writing TableRow's instead of dicts.
-    final_rows = []
-    for i, row in enumerate(rows):
-      json_row = self._convert_to_json_row(row)
-      insert_id = str(self.unique_row_id) if not insert_ids else insert_ids[i]
-      final_rows.append(
-          bigquery.TableDataInsertAllRequest.RowsValueListEntry(
-              insertId=insert_id, json=json_row))
-    result, errors = self._insert_all_rows(
-        project_id, dataset_id, table_id, final_rows, skip_invalid_rows)
-    return result, errors
+    # # Prepare rows for insertion. Of special note is the row ID that we add to
+    # # each row in order to help BigQuery avoid inserting a row multiple times.
+    # # BigQuery will do a best-effort if unique IDs are provided. This situation
+    # # can happen during retries on failures.
+    # # TODO(silviuc): Must add support to writing TableRow's instead of dicts.
+    # final_rows = []
+    # for i, row in enumerate(rows):
+    #   json_row = self._convert_to_json_row(row)
+    #   insert_id = str(self.unique_row_id) if not insert_ids else insert_ids[i]
+    #   final_rows.append(
+    #       bigquery.TableDataInsertAllRequest.RowsValueListEntry(
+    #           insertId=insert_id, json=json_row))
+    # result, errors = self._insert_all_rows(
+    #     project_id, dataset_id, table_id, final_rows, skip_invalid_rows)
+    # return result, errors
 
   def _convert_to_json_row(self, row):
     json_object = bigquery.JsonObject()
@@ -1307,25 +1222,25 @@ class BigQueryReader(dataflow_io.NativeSourceReader):
   def __iter__(self):
     if not self.bq_io_metadata:
       self.bq_io_metadata = create_bigquery_io_metadata()
-    for rows, schema in self.client.run_query(
+    row_iterator = self.client.run_query(
         project_id=self.executing_project, query=self.query,
         use_legacy_sql=self.use_legacy_sql,
         flatten_results=self.flatten_results,
         job_labels=self.bq_io_metadata.add_additional_bq_job_labels(
-            self.bigquery_job_labels)):
-      if self.schema is None:
-        self.schema = schema
-      for row in rows:
-        # return base64 encoded bytes as byte type on python 3
-        # which matches the behavior of Beam Java SDK
-        for i in range(len(row.f)):
-          if self.schema.fields[i].type == 'BYTES' and row.f[i].v:
-            row.f[i].v.string_value = row.f[i].v.string_value.encode('utf-8')
+            self.bigquery_job_labels))
+    if self.schema is None:
+      self.schema = row_iterator.schema
+    for row in row_iterator:
+      # return base64 encoded bytes as byte type on python 3
+      # which matches the behavior of Beam Java SDK
+      for i in range(len(row.f)):
+        if self.schema.fields[i].type == 'BYTES' and row.f[i].v:
+          row.f[i].v.string_value = row.f[i].v.string_value.encode('utf-8')
 
-        if self.row_as_dict:
-          yield self.client.convert_row_to_dict(row, schema)
-        else:
-          yield row
+      if self.row_as_dict:
+        yield self.client.convert_row_to_dict(row, schema)
+      else:
+        yield row
 
 
 class BigQueryWriter(dataflow_io.NativeSinkWriter):

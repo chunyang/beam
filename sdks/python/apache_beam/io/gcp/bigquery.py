@@ -741,7 +741,7 @@ class _CustomBigQuerySource(BoundedSource):
           kms_key=self.kms_key,
           job_labels=self._get_bq_metadata().add_additional_bq_job_labels(
               self.bigquery_job_labels))
-      size = int(job.statistics.totalBytesProcessed)
+      size = job.total_bytes_processed
       return size
     else:
       # Size estimation is best effort. We return None as we have
@@ -832,7 +832,7 @@ class _CustomBigQuerySource(BoundedSource):
         kms_key=self.kms_key,
         job_labels=self._get_bq_metadata().add_additional_bq_job_labels(
             self.bigquery_job_labels))
-    job_ref = job.jobReference
+    job_ref = job.to_api_repr()["jobReference"]
     bq.wait_for_bq_job(job_ref, max_retries=0)
     return bq._get_temp_table(self._get_project())
 
@@ -1312,10 +1312,10 @@ class BigQueryWriteFn(DoFn):
           skip_invalid_rows=True)
       self.batch_latency_metric.update((time.time() - start) * 1000)
 
-      failed_rows = [rows[entry.index] for entry in errors]
+      failed_rows = [rows[entry["index"]] for entry in errors]
       should_retry = any(
           RetryStrategy.should_retry(
-              self._retry_strategy, entry.errors[0].reason) for entry in errors)
+              self._retry_strategy, entry["errors"][0]["reason"]) for entry in errors)
       if not passed:
         self.failed_rows_metric.update(len(failed_rows))
         message = (

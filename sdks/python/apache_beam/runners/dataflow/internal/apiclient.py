@@ -529,12 +529,16 @@ class DataflowApplicationClient(object):
       credentials = get_service_credentials()
 
     http_client = get_new_http()
+    # FIXME: This constructor calls credentials.authorize() which doesn't
+    # exist for google.auth.credentials.Credentials
     self._client = dataflow.DataflowV1b3(
         url=self.google_cloud_options.dataflow_endpoint,
         credentials=credentials,
         get_credentials=(not self.google_cloud_options.no_auth),
         http=http_client,
         response_encoding=get_response_encoding())
+    # FIXME: This constructor calls credentials.authorize() which doesn't
+    # exist for google.auth.credentials.Credentials
     self._storage_client = storage.StorageV1(
         url='https://www.googleapis.com/storage/v1',
         credentials=credentials,

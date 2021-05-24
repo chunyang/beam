@@ -249,7 +249,7 @@ class _BigQueryReadSplit(beam.transforms.DoFn):
         kms_key=self.kms_key,
         job_labels=self._get_bq_metadata().add_additional_bq_job_labels(
             self.bigquery_job_labels))
-    job_ref = job.jobReference
+    job_ref = job.to_api_repr()["jobReference"]
     bq.wait_for_bq_job(job_ref, max_retries=0)
     return bq._get_temp_table(self._get_project())
 

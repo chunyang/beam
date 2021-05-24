@@ -146,6 +146,8 @@ class GcsIO(object):
   """Google Cloud Storage I/O client."""
   def __init__(self, storage_client=None):
     if storage_client is None:
+      # FIXME: This constructor calls credentials.authorize() which doesn't
+      # exist for google.auth.credentials.Credentials
       storage_client = storage.StorageV1(
           credentials=auth.get_service_credentials(),
           get_credentials=False,
